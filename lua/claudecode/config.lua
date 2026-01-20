@@ -126,6 +126,19 @@ function M.validate(config)
     end
   end
 
+  -- Validate cleanup_strategy if present
+  if config.terminal.cleanup_strategy ~= nil then
+    local valid_strategies = { "pkill_children", "jobstop_only", "aggressive", "none" }
+    local is_valid_strategy = false
+    for _, strategy in ipairs(valid_strategies) do
+      if config.terminal.cleanup_strategy == strategy then
+        is_valid_strategy = true
+        break
+      end
+    end
+    assert(is_valid_strategy, "terminal.cleanup_strategy must be one of: " .. table.concat(valid_strategies, ", "))
+  end
+
   local valid_log_levels = { "trace", "debug", "info", "warn", "error" }
   local is_valid_log_level = false
   for _, level in ipairs(valid_log_levels) do

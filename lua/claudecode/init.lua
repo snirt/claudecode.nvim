@@ -374,6 +374,12 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = vim.api.nvim_create_augroup("ClaudeCodeShutdown", { clear = true }),
     callback = function()
+      -- Kill all Claude terminal processes first to prevent orphans
+      local ok, terminal = pcall(require, "claudecode.terminal")
+      if ok and terminal.cleanup_all then
+        terminal.cleanup_all()
+      end
+
       if M.state.server then
         M.stop()
       else

@@ -188,6 +188,46 @@ local function setup_terminal_events(term_instance, config, session_id)
   end, { buf = true })
 end
 
+---Track terminal PID with retry mechanism
+---Snacks.terminal.open() may not set terminal_job_id immediately on the buffer.
+---This function retries tracking until successful or max retries reached.
+---@param term_buf number The terminal buffer number
+---@param max_retries number Maximum number of retries (default 5)
+---@param delay_ms number Delay between retries in milliseconds (default 50)
+local function track_pid_with_retry(term_buf, max_retries, delay_ms)
+  max_retries = max_retries or 5
+  delay_ms = delay_ms or 50
+  local retries = 0
+
+  local function try_track()
+    if not term_buf or not vim.api.nvim_buf_is_valid(term_buf) then
+      return
+    end
+
+    local ok, job_id = pcall(vim.api.nvim_buf_get_var, term_buf, "terminal_job_id")
+    if ok and job_id then
+      local terminal_module = require("claudecode.terminal")
+      if terminal_module.track_terminal_pid then
+        terminal_module.track_terminal_pid(job_id)
+        local logger = require("claudecode.logger")
+        logger.debug("terminal", "PID tracked for job_id: " .. tostring(job_id) .. " (attempt " .. (retries + 1) .. ")")
+      end
+      return
+    end
+
+    retries = retries + 1
+    if retries < max_retries then
+      vim.defer_fn(try_track, delay_ms * retries)
+    else
+      local logger = require("claudecode.logger")
+      logger.warn("terminal", "Failed to track PID for buffer " .. term_buf .. " after " .. max_retries .. " retries")
+    end
+  end
+
+  -- Start the first attempt
+  try_track()
+end
+
 ---Build initial title for session tabs
 ---@param session_id string|nil Optional session ID
 ---@return string title The title string
@@ -320,6 +360,32 @@ local function create_terminal_buffer(cmd_string, env_table, config, session_id)
       logger.debug("terminal", string.format("Restored window dimensions: %dx%d", saved_width, saved_height or 0))
     end
 
+    -- Track PID for cleanup on Neovim exit (with retry mechanism)
+    -- Snacks.terminal.open() may not set terminal_job_id immediately
+    if term_instance.buf then
+      track_pid_with_retry(term_instance.buf, 5, 50)
+
+      -- Set up BufUnload autocmd to ensure job is stopped when buffer is deleted
+      -- This catches :bd!, Neovim exit, and any other buffer deletion path
+      -- that bypasses close_session()
+      vim.api.nvim_create_autocmd("BufUnload", {
+        buffer = term_instance.buf,
+        once = true,
+        callback = function()
+          local unload_ok, unload_job_id = pcall(vim.api.nvim_buf_get_var, term_instance.buf, "terminal_job_id")
+          if unload_ok and unload_job_id then
+            -- Get Unix PID from Neovim job ID
+            local pid_ok, pid = pcall(vim.fn.jobpid, unload_job_id)
+            if pid_ok and pid and pid > 0 then
+              -- Kill child processes first (shell wrappers like fish don't forward SIGTERM)
+              pcall(vim.fn.system, "pkill -TERM -P " .. pid .. " 2>/dev/null")
+            end
+            pcall(vim.fn.jobstop, unload_job_id)
+          end
+        end,
+      })
+    end
+
     setup_terminal_events(term_instance, config, session_id)
     return term_instance
   end
@@ -370,11 +436,20 @@ function M.open(cmd_string, env_table, config, focus)
       terminal_module.setup_terminal_keymaps(term_instance.buf, config)
     end
 
+    -- Prevent mouse scroll from escaping to terminal scrollback
+    if term_instance.buf then
+      vim.keymap.set("t", "<ScrollWheelUp>", "<Nop>", { buffer = term_instance.buf, silent = true })
+      vim.keymap.set("t", "<ScrollWheelDown>", "<Nop>", { buffer = term_instance.buf, silent = true })
+    end
+
     -- Update session info
     session_manager.update_terminal_info(session_id, {
       bufnr = term_instance.buf,
       winid = window_manager.get_window(),
     })
+
+    -- Register buffer-to-session mapping for cleanup on BufUnload (Fix 1)
+    require("claudecode.terminal").register_buffer_session(term_instance.buf, session_id)
 
     -- Attach tabbar
     local winid = window_manager.get_window()
@@ -560,9 +635,18 @@ function M.open_session(session_id, cmd_string, env_table, config, focus)
       winid = window_manager.get_window(),
     })
 
+    -- Register buffer-to-session mapping for cleanup on BufUnload (Fix 1)
+    terminal_module.register_buffer_session(term_instance.buf, session_id)
+
     -- Set up smart ESC handling if enabled
     if config.esc_timeout and config.esc_timeout > 0 and term_instance.buf then
       terminal_module.setup_terminal_keymaps(term_instance.buf, config)
+    end
+
+    -- Prevent mouse scroll from escaping to terminal scrollback
+    if term_instance.buf then
+      vim.keymap.set("t", "<ScrollWheelUp>", "<Nop>", { buffer = term_instance.buf, silent = true })
+      vim.keymap.set("t", "<ScrollWheelDown>", "<Nop>", { buffer = term_instance.buf, silent = true })
     end
 
     -- Setup OSC title handler
@@ -604,6 +688,21 @@ function M.close_session(session_id)
   if term_instance and term_instance:buf_valid() then
     -- Mark as intentional close to suppress error message
     closing_sessions[session_id] = true
+
+    -- Stop the job first to ensure the process is terminated
+    if term_instance.buf then
+      local ok, job_id = pcall(vim.api.nvim_buf_get_var, term_instance.buf, "terminal_job_id")
+      if ok and job_id then
+        -- Get Unix PID from Neovim job ID
+        local pid_ok, pid = pcall(vim.fn.jobpid, job_id)
+        if pid_ok and pid and pid > 0 then
+          -- Kill child processes first (shell wrappers like fish don't forward SIGTERM)
+          pcall(vim.fn.system, "pkill -TERM -P " .. pid .. " 2>/dev/null")
+        end
+        -- Then kill the shell process
+        pcall(vim.fn.jobstop, job_id)
+      end
+    end
 
     -- Cleanup OSC handler
     if term_instance.buf then
@@ -690,6 +789,22 @@ function M.close_session_keep_window(old_session_id, new_session_id, effective_c
     window_manager.close_window()
   end
 
+  -- Stop the old job first to ensure the process is terminated
+  -- Kill child processes first (shell wrappers like fish don't forward SIGTERM)
+  if old_term and old_term:buf_valid() and old_term.buf then
+    local ok, job_id = pcall(vim.api.nvim_buf_get_var, old_term.buf, "terminal_job_id")
+    if ok and job_id then
+      -- Get Unix PID from Neovim job ID
+      local pid_ok, pid = pcall(vim.fn.jobpid, job_id)
+      if pid_ok and pid and pid > 0 then
+        -- Kill child processes first (e.g., claude spawned by fish)
+        pcall(vim.fn.system, "pkill -TERM -P " .. pid .. " 2>/dev/null")
+      end
+      -- Then kill the shell process
+      pcall(vim.fn.jobstop, job_id)
+    end
+  end
+
   -- Clean up old terminal's buffer
   if old_term and old_term:buf_valid() then
     if old_term.buf then
@@ -701,7 +816,9 @@ function M.close_session_keep_window(old_session_id, new_session_id, effective_c
   end
 
   terminals[old_session_id] = nil
-  closing_sessions[old_session_id] = nil
+  -- NOTE: Don't clear closing_sessions here - let TermClose handler do it
+  -- If we clear it before TermClose fires, the handler thinks it's a crash
+  -- and incorrectly closes the window
 
   logger.debug("terminal", "Closed session " .. old_session_id .. " and switched to " .. new_session_id)
 end

@@ -9,6 +9,91 @@ local claudecode_server_module = require("claudecode.server.init")
 local osc_handler = require("claudecode.terminal.osc_handler")
 local session_manager = require("claudecode.session")
 
+-- Use global to survive module reloads (Fix 3: Plugin Reload Protection)
+---@type table<number, number> Map of job_id -> unix_pid
+_G._claudecode_tracked_pids = _G._claudecode_tracked_pids or {}
+local tracked_pids = _G._claudecode_tracked_pids
+
+-- Buffer to session mapping for cleanup on BufUnload (Fix 1: Zombie Sessions)
+---@type table<number, string> Map of bufnr -> session_id
+_G._claudecode_buffer_to_session = _G._claudecode_buffer_to_session or {}
+local buffer_to_session = _G._claudecode_buffer_to_session
+
+---Cleanup orphaned PIDs from previous module load (Fix 3: Plugin Reload Protection)
+---Called on module load to kill any processes that were orphaned by a plugin reload
+local function cleanup_orphaned_pids()
+  for job_id, pid in pairs(tracked_pids) do
+    -- Check if job still exists
+    local exists = pcall(vim.fn.jobpid, job_id)
+    if not exists then
+      -- Job doesn't exist but PID tracked - orphaned
+      if pid and pid > 0 then
+        pcall(vim.fn.system, "pkill -TERM -P " .. pid .. " 2>/dev/null")
+        pcall(vim.fn.system, "kill -TERM " .. pid .. " 2>/dev/null")
+      end
+      tracked_pids[job_id] = nil
+    end
+  end
+end
+
+-- Run cleanup on module load
+cleanup_orphaned_pids()
+
+---Track a terminal job's PID for cleanup on exit
+---@param job_id number The Neovim job ID
+function M.track_terminal_pid(job_id)
+  if not job_id then
+    return
+  end
+  local ok, pid = pcall(vim.fn.jobpid, job_id)
+  if ok and pid and pid > 0 then
+    tracked_pids[job_id] = pid
+  end
+end
+
+---Untrack a terminal job (called when terminal exits normally)
+---@param job_id number The Neovim job ID
+function M.untrack_terminal_pid(job_id)
+  if job_id then
+    tracked_pids[job_id] = nil
+  end
+end
+
+---Register a buffer-to-session mapping for cleanup on BufUnload (Fix 1)
+---@param bufnr number The buffer number
+---@param session_id string The session ID
+function M.register_buffer_session(bufnr, session_id)
+  if bufnr and session_id then
+    buffer_to_session[bufnr] = session_id
+  end
+end
+
+---Unregister a buffer-to-session mapping (called when session is properly destroyed)
+---@param bufnr number The buffer number
+function M.unregister_buffer_session(bufnr)
+  if bufnr then
+    buffer_to_session[bufnr] = nil
+  end
+end
+
+-- Setup global BufUnload handler to cleanup orphaned sessions (Fix 1: Zombie Sessions)
+-- This catches :bd! and other direct buffer deletions that bypass close_session()
+vim.api.nvim_create_autocmd("BufUnload", {
+  group = vim.api.nvim_create_augroup("ClaudeCodeBufferCleanup", { clear = true }),
+  callback = function(ev)
+    local session_id = buffer_to_session[ev.buf]
+    if session_id then
+      buffer_to_session[ev.buf] = nil
+      -- Destroy orphaned session if it still exists
+      if session_manager.get_session(session_id) then
+        local logger = require("claudecode.logger")
+        logger.debug("terminal", "Auto-destroying orphaned session on BufUnload: " .. session_id)
+        session_manager.destroy_session(session_id)
+      end
+    end
+  end,
+})
+
 ---@type ClaudeCodeTerminalConfig
 local defaults = {
   split_side = "right",
@@ -33,6 +118,12 @@ local defaults = {
   -- Smart ESC handling: timeout in ms to wait for second ESC before sending ESC to terminal
   -- Set to nil or 0 to disable smart ESC handling (use simple keymap instead)
   esc_timeout = 200,
+  -- Process cleanup strategy when Neovim exits
+  -- "pkill_children" - Kill child processes first, then shell (recommended, fixes race condition)
+  -- "jobstop_only"   - Only use Neovim's jobstop (relies on shell forwarding SIGTERM)
+  -- "aggressive"     - Use SIGKILL for guaranteed termination (may leave state)
+  -- "none"           - Don't kill processes on exit (manual cleanup)
+  cleanup_strategy = "pkill_children",
   -- Tab bar for session switching (optional)
   tabs = {
     enabled = false, -- Off by default
@@ -711,6 +802,18 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
           vim.log.levels.WARN
         )
       end
+    elseif k == "cleanup_strategy" then
+      local valid_strategies = { pkill_children = true, jobstop_only = true, aggressive = true, none = true }
+      if valid_strategies[v] then
+        defaults.cleanup_strategy = v
+      else
+        vim.notify(
+          "claudecode.terminal.setup: Invalid value for cleanup_strategy: "
+            .. tostring(v)
+            .. ". Must be one of: pkill_children, jobstop_only, aggressive, none.",
+          vim.log.levels.WARN
+        )
+      end
     elseif k == "tabs" then
       if type(v) == "table" then
         defaults.tabs = defaults.tabs or {}
@@ -1193,6 +1296,162 @@ end
 ---@return string session_id The session ID
 function M.ensure_session()
   return session_manager.ensure_session()
+end
+
+---Cleanup all terminal processes (called on Neovim exit).
+---Ensures no orphan Claude processes remain by killing all terminal jobs.
+---Uses the configured cleanup_strategy to determine how processes are terminated.
+---Implements defense-in-depth: recovers PIDs from sessions and terminal buffers
+---even if they weren't properly tracked.
+function M.cleanup_all()
+  local logger = require("claudecode.logger")
+  local strategy = defaults.cleanup_strategy or "pkill_children"
+
+  -- Defense-in-depth: Recover PIDs from session manager
+  -- This catches any terminals whose PIDs weren't properly tracked
+  local session_mgr_ok, session_mgr = pcall(require, "claudecode.session")
+  if session_mgr_ok and session_mgr.list_sessions then
+    for _, session in ipairs(session_mgr.list_sessions()) do
+      if session.terminal_jobid and not tracked_pids[session.terminal_jobid] then
+        local pid_ok, pid = pcall(vim.fn.jobpid, session.terminal_jobid)
+        if pid_ok and pid and pid > 0 then
+          tracked_pids[session.terminal_jobid] = pid
+          logger.debug("terminal", "Recovered PID " .. pid .. " from session " .. session.id)
+        end
+      end
+    end
+  end
+
+  -- Defense-in-depth: Recover PIDs from terminal buffers
+  -- This catches any terminal buffers that weren't associated with sessions
+  local list_bufs_ok, bufs = pcall(vim.api.nvim_list_bufs)
+  if list_bufs_ok and bufs then
+    for _, bufnr in ipairs(bufs) do
+      local valid_ok, is_valid = pcall(vim.api.nvim_buf_is_valid, bufnr)
+      if valid_ok and is_valid then
+        local buftype_ok, buftype = pcall(vim.api.nvim_get_option_value, "buftype", { buf = bufnr })
+        if buftype_ok and buftype == "terminal" then
+          local job_ok, job_id = pcall(vim.api.nvim_buf_get_var, bufnr, "terminal_job_id")
+          if job_ok and job_id and not tracked_pids[job_id] then
+            local pid_ok, pid = pcall(vim.fn.jobpid, job_id)
+            if pid_ok and pid and pid > 0 then
+              tracked_pids[job_id] = pid
+              logger.debug("terminal", "Recovered PID " .. pid .. " from terminal buffer " .. bufnr)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- Collect PIDs and job IDs first (don't stop jobs yet - that's the race condition!)
+  local pids_to_kill = {}
+  local job_ids_to_stop = {}
+
+  for job_id, pid in pairs(tracked_pids) do
+    if pid and pid > 0 then
+      table.insert(pids_to_kill, pid)
+    end
+    table.insert(job_ids_to_stop, job_id)
+  end
+
+  -- DEBUG: Write to file so we can see what happens after Neovim exits
+  local debug_file = io.open("/tmp/claudecode_cleanup_debug.log", "a")
+  if debug_file then
+    debug_file:write(
+      os.date() .. " cleanup_all: strategy=" .. strategy .. ", pids=" .. table.concat(pids_to_kill, ",") .. "\n"
+    )
+    debug_file:close()
+  end
+
+  logger.debug("terminal", "cleanup_all: strategy=" .. strategy .. ", found " .. #pids_to_kill .. " PIDs")
+
+  -- Handle "none" strategy - don't kill anything
+  if strategy == "none" then
+    logger.debug("terminal", "cleanup_all: strategy=none, skipping process cleanup")
+    -- Clear tracking but don't kill
+    tracked_pids = {}
+    _G._claudecode_tracked_pids = tracked_pids
+    return
+  end
+
+  -- For pkill_children strategy: kill children FIRST to fix race condition
+  -- This must happen BEFORE jobstop(), otherwise the shell is killed before children
+  if strategy == "pkill_children" and #pids_to_kill > 0 then
+    local kill_cmds = {}
+    for _, pid in ipairs(pids_to_kill) do
+      -- Kill the entire process tree recursively, not just direct children
+      -- 1. First, try to kill by process group (catches all descendants)
+      table.insert(kill_cmds, "kill -TERM -" .. pid .. " 2>/dev/null")
+      -- 2. Kill direct children
+      table.insert(kill_cmds, "pkill -TERM -P " .. pid .. " 2>/dev/null")
+      -- 3. Kill the shell process itself
+      table.insert(kill_cmds, "kill -TERM " .. pid .. " 2>/dev/null")
+    end
+    local cmd = table.concat(kill_cmds, "; ") .. "; true"
+
+    debug_file = io.open("/tmp/claudecode_cleanup_debug.log", "a")
+    if debug_file then
+      debug_file:write(os.date() .. " pkill_children command: " .. cmd .. "\n")
+      debug_file:close()
+    end
+
+    vim.fn.system(cmd)
+
+    -- Give processes time to die gracefully
+    vim.fn.system("sleep 0.1")
+
+    -- Second pass: kill any survivors with SIGKILL
+    local kill9_cmds = {}
+    for _, pid in ipairs(pids_to_kill) do
+      -- Kill entire process group with SIGKILL
+      table.insert(kill9_cmds, "kill -KILL -" .. pid .. " 2>/dev/null")
+      -- Kill remaining children with SIGKILL
+      table.insert(kill9_cmds, "pkill -KILL -P " .. pid .. " 2>/dev/null")
+      -- Kill the process itself with SIGKILL
+      table.insert(kill9_cmds, "kill -KILL " .. pid .. " 2>/dev/null")
+    end
+    local cmd9 = table.concat(kill9_cmds, "; ") .. "; true"
+
+    debug_file = io.open("/tmp/claudecode_cleanup_debug.log", "a")
+    if debug_file then
+      debug_file:write(os.date() .. " SIGKILL followup: " .. cmd9 .. "\n")
+      debug_file:close()
+    end
+
+    vim.fn.system(cmd9)
+    logger.debug("terminal", "cleanup_all: killed process trees of PIDs: " .. table.concat(pids_to_kill, ", "))
+  end
+
+  -- For aggressive strategy: use SIGKILL for guaranteed termination
+  if strategy == "aggressive" and #pids_to_kill > 0 then
+    local kill_cmds = {}
+    for _, pid in ipairs(pids_to_kill) do
+      -- Kill children with SIGKILL
+      table.insert(kill_cmds, "pkill -KILL -P " .. pid)
+      -- Kill the process itself with SIGKILL
+      table.insert(kill_cmds, "kill -KILL " .. pid)
+    end
+    local cmd = table.concat(kill_cmds, "; ") .. "; true"
+
+    debug_file = io.open("/tmp/claudecode_cleanup_debug.log", "a")
+    if debug_file then
+      debug_file:write(os.date() .. " aggressive kill command: " .. cmd .. "\n")
+      debug_file:close()
+    end
+
+    vim.fn.system(cmd)
+    logger.debug("terminal", "cleanup_all: aggressively killed PIDs: " .. table.concat(pids_to_kill, ", "))
+  end
+
+  -- Stop jobs via Neovim API (all strategies except "none")
+  for _, job_id in ipairs(job_ids_to_stop) do
+    pcall(vim.fn.jobstop, job_id)
+  end
+
+  -- Clear tracked PIDs (update both local and global)
+  tracked_pids = {}
+  _G._claudecode_tracked_pids = tracked_pids
 end
 
 return M
