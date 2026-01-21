@@ -57,7 +57,7 @@ function M.disable()
 end
 
 ---Creates autocommands for tracking selections.
----Sets up listeners for CursorMoved, CursorMovedI, BufEnter, ModeChanged, and TextChanged events.
+---Sets up listeners for CursorMoved, CursorMovedI, BufEnter, WinEnter, ModeChanged, and TextChanged events.
 ---@local
 function M._create_autocommands()
   local group = vim.api.nvim_create_augroup("ClaudeCodeSelection", { clear = true })
@@ -80,6 +80,13 @@ function M._create_autocommands()
     group = group,
     callback = function()
       M.on_text_changed()
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = group,
+    callback = function()
+      M.on_win_enter()
     end,
   })
 end
@@ -147,6 +154,25 @@ end
 ---Triggers a debounced update of the selection.
 function M.on_text_changed()
   M.debounce_update()
+end
+
+---Handles window enter events.
+---Triggers an immediate update to ensure file reference is sent on keyboard navigation.
+---Uses a small delay similar to mouse handler to ensure state is settled.
+function M.on_win_enter()
+  -- Cancel any pending debounce to avoid duplicate updates
+  if M.state.debounce_timer then
+    vim.loop.timer_stop(M.state.debounce_timer)
+    M.state.debounce_timer = nil
+  end
+
+  -- Use a small delay to ensure window/buffer state is settled
+  -- This mirrors the mouse handler behavior which works reliably
+  vim.defer_fn(function()
+    if M.state.tracking_enabled then
+      M.update_selection()
+    end
+  end, 10)
 end
 
 ---Debounces selection updates.
