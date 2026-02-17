@@ -38,6 +38,22 @@ local function find_terminal_window()
   return nil
 end
 
+---Restore the terminal window to its configured width percentage
+---@return boolean success
+local function restore_configured_width()
+  if not state.winid or not vim.api.nvim_win_is_valid(state.winid) then
+    return false
+  end
+  if not state.config then
+    return false
+  end
+  local split_width_percentage = state.config.split_width_percentage or 0.4
+  local total_width = vim.o.columns
+  local width = math.floor(total_width * split_width_percentage)
+  vim.api.nvim_win_set_width(state.winid, width)
+  return true
+end
+
 ---Create a split window for the terminal
 ---@param config table Window configuration
 ---@return number|nil winid
@@ -75,10 +91,90 @@ local function create_split_window(config)
   return winid
 end
 
+---Notify the terminal of its current dimensions (sends SIGWINCH)
+---Call this when window size may have changed
+function M.notify_resize()
+  if not state.winid or not vim.api.nvim_win_is_valid(state.winid) then
+    return
+  end
+
+  local bufnr = vim.api.nvim_win_get_buf(state.winid)
+  local chan = vim.bo[bufnr].channel
+  if chan and chan > 0 then
+    local width = vim.api.nvim_win_get_width(state.winid)
+    local height = vim.api.nvim_win_get_height(state.winid)
+    pcall(vim.fn.jobresize, chan, width, height)
+    logger.debug("window_manager", string.format("Resize notification: %dx%d", width, height))
+  end
+end
+
+---Setup autocommands for terminal resize notifications
+local function setup_resize_autocommands()
+  local group = vim.api.nvim_create_augroup("ClaudeCodeTerminalResize", { clear = true })
+
+  -- Handle Neovim window resize
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = group,
+    callback = function()
+      restore_configured_width()
+      M.notify_resize()
+    end,
+  })
+
+  -- Handle window enter - resize terminal if one exists in current tab
+  -- This catches keyboard navigation between windows
+  vim.api.nvim_create_autocmd("WinEnter", {
+    group = group,
+    callback = function()
+      -- Find terminal in current tab (may differ from state.winid after tab switch)
+      local terminal_win = find_terminal_window()
+      if terminal_win then
+        state.winid = terminal_win
+        state.current_bufnr = vim.api.nvim_win_get_buf(terminal_win)
+        vim.defer_fn(function()
+          M.notify_resize()
+        end, 50)
+      end
+    end,
+  })
+
+  -- Handle tab enter (switching between tabs)
+  vim.api.nvim_create_autocmd("TabEnter", {
+    group = group,
+    callback = function()
+      -- Find terminal window in the new tab and update state
+      local terminal_win = find_terminal_window()
+      if terminal_win then
+        state.winid = terminal_win
+        state.current_bufnr = vim.api.nvim_win_get_buf(terminal_win)
+        -- Longer delay for tab switches to ensure everything is settled
+        vim.defer_fn(function()
+          restore_configured_width()
+          M.notify_resize()
+        end, 100)
+      end
+    end,
+  })
+
+  -- Handle entering terminal mode (pressing i in terminal)
+  vim.api.nvim_create_autocmd("TermEnter", {
+    group = group,
+    callback = function()
+      local terminal_win = find_terminal_window()
+      if terminal_win then
+        state.winid = terminal_win
+        state.current_bufnr = vim.api.nvim_win_get_buf(terminal_win)
+        M.notify_resize()
+      end
+    end,
+  })
+end
+
 ---Initialize the window manager with configuration
 ---@param config table Configuration options
 function M.setup(config)
   state.config = config or {}
+  setup_resize_autocommands()
   logger.debug("window_manager", "Window manager initialized")
 end
 
